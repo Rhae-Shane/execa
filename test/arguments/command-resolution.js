@@ -14,6 +14,18 @@ setFixtureDirectory();
 
 const isWindows = process.platform === 'win32';
 
+const copyShimOnce = (sourceName, destinationName) => {
+	const destination = path.join(FIXTURES_DIRECTORY, 'node_modules', '.bin', destinationName);
+	return mkdir(path.dirname(destination), {recursive: true})
+		.then(() => cp(path.join(FIXTURES_DIRECTORY, sourceName), destination))
+		.then(() => destination);
+};
+
+const cmdShimPromise = isWindows ? copyShimOnce('echo-cmd-shim.cmd', 'echo-cmd-shim.cmd') : undefined;
+const batShimPromise = isWindows ? copyShimOnce('echo-cmd-shim.bat', 'echo-cmd-shim.bat') : undefined;
+const setupCmdShim = () => cmdShimPromise;
+const setupBatShim = () => batShimPromise;
+
 // These tests cover the command resolution and argument escaping performed by
 // `lib/arguments/command-file.js`, which allows running scripts, `.cmd`/`.bat` files
 // and shebang scripts without a shell, and prevents command injection on Windows.
@@ -344,16 +356,9 @@ if (isWindows) {
 	});
 
 	/*
-	Metacharacters are double-escaped for batch files, since `cmd.exe` interprets them once when the batch file is invoked and once when it re-expands the arguments with `%*`.
-	The `cmd`-shims npm generates in `node_modules/.bin/` are the canonical example.
+	Metacharacters are double-escaped only for npm cmd-shims in `node_modules/.bin`, since those re-expand `%*` through a second `cmd.exe` parse.
+	Regular `.cmd`/`.bat` files that inspect `%~1` are escaped once.
 	*/
-	const setupCmdShim = async () => {
-		const binaryDirectory = path.join(FIXTURES_DIRECTORY, 'node_modules', '.bin');
-		await mkdir(binaryDirectory, {recursive: true});
-		const shimPath = path.join(binaryDirectory, 'echo-cmd-shim.cmd');
-		await cp(path.join(FIXTURES_DIRECTORY, 'echo-cmd-shim.cmd'), shimPath);
-		return shimPath;
-	};
 
 	test('Double-escapes metacharacters for node_modules/.bin cmd-shims', async t => {
 		const shimPath = await setupCmdShim();
@@ -365,14 +370,24 @@ if (isWindows) {
 		t.is(stdoutSync, commandArgument);
 	});
 
-	test('Double-escapes explicit batch files excluded from PATHEXT', async t => {
+	test('Double-escapes explicit cmd-shims excluded from PATHEXT', async t => {
 		const commandArgument = '"& whoami &"';
-		const command = path.join(FIXTURES_DIRECTORY, 'echo-shim.cmd');
+		const command = await setupCmdShim();
 		const {stdout} = await execa(command, [commandArgument], nodeOnlyOptions);
 		t.is(stdout, commandArgument);
 
 		const {stdout: stdoutSync} = execaSync(command, [commandArgument], nodeOnlyOptions);
 		t.is(stdoutSync, commandArgument);
+	});
+
+	test('Does not double-escape regular batch files that inspect arguments', async t => {
+		const command = path.join(FIXTURES_DIRECTORY, 'args.cmd');
+		const filePath = String.raw`C:\repo\pom.xml`;
+		const {stdout} = await execa(command, ['-f', filePath]);
+		t.is(stdout, `file is ${filePath}`);
+
+		const {stdout: stdoutSync} = execaSync(command, ['-f', filePath]);
+		t.is(stdoutSync, `file is ${filePath}`);
 	});
 
 	test('Runs an explicit shebang script excluded from PATHEXT', async t => {
@@ -411,17 +426,18 @@ if (isWindows) {
 	});
 }
 
-// On Windows, `.cmd`/`.bat` files are run through `cmd.exe`, which interprets several
+// On Windows, npm cmd-shims are run through `cmd.exe`, which interprets several
 // characters specially. Those must be escaped in arguments, otherwise they could expand
-// variables or inject commands (the "BatBadBut" class of vulnerabilities). `echo-shim.cmd`
-// forwards its arguments to `echo.js`, so the subprocess prints back the exact
-// `process.argv` it received: each argument must arrive unchanged and inert.
+// variables or inject commands (the "BatBadBut" class of vulnerabilities). The
+// `node_modules/.bin` shim forwards its arguments to `echo.js`, so the subprocess prints
+// back the exact `process.argv` it received: each argument must arrive unchanged and inert.
 if (isWindows) {
 	const testEscaping = async (t, commandArgument) => {
-		const {stdout} = await execa('echo-shim.cmd', [commandArgument]);
+		const shimPath = await setupCmdShim();
+		const {stdout} = await execa(shimPath, [commandArgument]);
 		t.is(stdout, commandArgument);
 
-		const {stdout: stdoutSync} = execaSync('echo-shim.cmd', [commandArgument]);
+		const {stdout: stdoutSync} = execaSync(shimPath, [commandArgument]);
 		t.is(stdoutSync, commandArgument);
 	};
 
@@ -448,15 +464,16 @@ if (isWindows) {
 
 	// Every kind of tricky argument must also roundtrip through `cmd.exe` unchanged, not
 	// just be inert. Unlike `echo.js` (which resolves to `node.exe` and bypasses `cmd.exe`),
-	// `echo-shim.cmd` forces the `cmd.exe` escaping path. This mirrors the roundtrip tests
+	// the cmd-shim forces the `cmd.exe` escaping path. This mirrors the roundtrip tests
 	// above, but validates the `cmd.exe`-specific escaping rather than Node's native escaping.
 	const testCmdRoundtrip = async (t, commandArguments) => {
 		const expectedStdout = commandArguments.join('\n');
+		const shimPath = await setupCmdShim();
 
-		const {stdout} = await execa('echo-shim.cmd', commandArguments);
+		const {stdout} = await execa(shimPath, commandArguments);
 		t.is(stdout, expectedStdout);
 
-		const {stdout: stdoutSync} = execaSync('echo-shim.cmd', commandArguments);
+		const {stdout: stdoutSync} = execaSync(shimPath, commandArguments);
 		t.is(stdoutSync, expectedStdout);
 	};
 
@@ -475,42 +492,43 @@ if (isWindows) {
 	test('Roundtrips arguments with spaces through cmd.exe', testCmdRoundtrip, ['a b', ' '.repeat(3), 'foo bar baz', 'André Cruz']);
 
 	/*
-	`.bat` files re-expand their arguments through `cmd.exe` exactly like `.cmd` files, so they need the same double-escaping.
-	`echo-shim.bat` is the `.bat` twin of `echo-shim.cmd`.
+	`.bat` cmd-shims in `node_modules/.bin` re-expand `%*` the same way as `.cmd` shims, so they need the same double-escaping.
 	*/
 	const testBatEscaping = async (t, commandArgument) => {
-		const {stdout} = await execa('echo-shim.bat', [commandArgument]);
+		const shimPath = await setupBatShim();
+		const {stdout} = await execa(shimPath, [commandArgument]);
 		t.is(stdout, commandArgument);
 
-		const {stdout: stdoutSync} = execaSync('echo-shim.bat', [commandArgument]);
+		const {stdout: stdoutSync} = execaSync(shimPath, [commandArgument]);
 		t.is(stdoutSync, commandArgument);
 	};
 
-	// The same nested-quote injection must stay inert when the batch file is a `.bat`.
-	test('Does not allow command injection via nested quotes in `.bat` arguments', testBatEscaping, '"& whoami &"');
-	// Metacharacters must survive the double `cmd.exe` expansion for `.bat` files too.
-	test('Roundtrips shell metacharacters through a `.bat` file', testBatEscaping, '(foo|bar>baz|foz)');
-	// A `.bat` file not in `node_modules/.bin/` must still be double-escaped, since the location is irrelevant: any batch file re-expands its arguments.
-	test('Does not expand environment variables in `.bat` arguments', testBatEscaping, '%PATH%');
-	// Backslashes, double quotes and metacharacters combined are the trickiest to escape, and must survive the double `cmd.exe` expansion of a `.bat` file intact.
-	test('Preserves backslashes, quotes and metacharacters in `.bat` arguments', testBatEscaping, 'a\\"&b\\\\"|c\\');
+	// The same nested-quote injection must stay inert when the cmd-shim is a `.bat`.
+	test('Does not allow command injection via nested quotes in `.bat` cmd-shim arguments', testBatEscaping, '"& whoami &"');
+	// Metacharacters must survive the double `cmd.exe` expansion for `.bat` cmd-shims too.
+	test('Roundtrips shell metacharacters through a `.bat` cmd-shim', testBatEscaping, '(foo|bar>baz|foz)');
+	test('Does not expand environment variables in `.bat` cmd-shim arguments', testBatEscaping, '%PATH%');
+	// Backslashes, double quotes and metacharacters combined are the trickiest to escape, and must survive the double `cmd.exe` expansion of a `.bat` cmd-shim intact.
+	test('Preserves backslashes, quotes and metacharacters in `.bat` cmd-shim arguments', testBatEscaping, 'a\\"&b\\\\"|c\\');
 	// Several tricky arguments passed together must each be double-escaped independently and arrive in order, not merged nor reordered.
-	test('Roundtrips multiple tricky arguments through a `.bat` file', async t => {
+	test('Roundtrips multiple tricky arguments through a `.bat` cmd-shim', async t => {
 		const commandArguments = ['a b', 'c&d', '"e"', 'f\\"g', '%h%'];
 		const expectedStdout = commandArguments.join('\n');
+		const shimPath = await setupBatShim();
 
-		const {stdout} = await execa('echo-shim.bat', commandArguments);
+		const {stdout} = await execa(shimPath, commandArguments);
 		t.is(stdout, expectedStdout);
 
-		const {stdout: stdoutSync} = execaSync('echo-shim.bat', commandArguments);
+		const {stdout: stdoutSync} = execaSync(shimPath, commandArguments);
 		t.is(stdoutSync, expectedStdout);
 	});
 
 	// `cmd.exe` interprets CR and LF as command separators and provides no way to escape
 	// them, so those are rejected to prevent command injection.
-	test('Rejects arguments containing a line break', t => {
-		t.throws(() => execa('echo-shim.cmd', ['a\r\nb']), {instanceOf: TypeError, message: /line break/});
-		t.throws(() => execaSync('echo-shim.cmd', ['a\r\nb']), {instanceOf: TypeError, message: /line break/});
+	test('Rejects arguments containing a line break', async t => {
+		const shimPath = await setupCmdShim();
+		t.throws(() => execa(shimPath, ['a\r\nb']), {instanceOf: TypeError, message: /line break/});
+		t.throws(() => execaSync(shimPath, ['a\r\nb']), {instanceOf: TypeError, message: /line break/});
 	});
 
 	// The command itself is validated too, not just its arguments.
@@ -521,7 +539,8 @@ if (isWindows) {
 
 	// A shell escapes the arguments itself, so the line break rejection does not apply.
 	test('Does not reject line breaks when using a shell', async t => {
-		await t.notThrowsAsync(execa('echo-shim.cmd', ['a\r\nb'], {shell: true, reject: false}));
-		t.notThrows(() => execaSync('echo-shim.cmd', ['a\r\nb'], {shell: true, reject: false}));
+		const shimPath = await setupCmdShim();
+		await t.notThrowsAsync(execa(shimPath, ['a\r\nb'], {shell: true, reject: false}));
+		t.notThrows(() => execaSync(shimPath, ['a\r\nb'], {shell: true, reject: false}));
 	});
 }

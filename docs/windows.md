@@ -53,6 +53,8 @@ Windows requires files and arguments to be quoted when they contain spaces, tabs
 
 When not using any shell, Execa performs that quoting automatically. This ensures files and arguments are split correctly.
 
+[npm cmd-shims](https://github.com/npm/cmd-shim) in `node_modules/.bin` re-expand `%*` through a second `cmd.exe` parse, so Execa caret-escapes those arguments twice. Other `.cmd` and `.bat` files (for example Maven's `mvn.cmd`) read `%~1` themselves and are escaped only once — double-escaping would leave leftover carets and break argument checks. This matches [`cross-spawn`](https://github.com/moxystudio/node-cross-spawn).
+
 ```js
 await execa`npm run ${'task with space'}`;
 ```
